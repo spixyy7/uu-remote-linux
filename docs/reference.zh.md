@@ -44,7 +44,7 @@ Portal 仅作用于本服务获授权的会话。文件传输、终端等独立�
 | Xfce | X11 | ✅ 虚拟机测试通过 | 默认 |
 | Cinnamon / MATE | X11 | ✅ 虚拟机测试通过 | 默认 |
 | Hyprland | Wayland（wlroots 原生协议） | 🧪 实验性，虚拟机测试（部分功能受限，见下） | `--features wayland` |
-| niri | Wayland（wlroots 原生协议） | 🧪 实验性，协议支持已按 niri 源码确认，尚未实机验收（#55） | `--features wayland` |
+| niri | Wayland（wlroots 原生协议） | 🧪 实验性，采集、文字输入及竖屏切换已实机验收，其余待验证（#55） | `--features wayland` |
 | GNOME / KDE Plasma | Wayland（xdg-desktop-portal） | 🧪 实验性，验证范围与限制见下 | `--features wayland,portal` |
 
 最后一列是源码编译方式；Release 预编译包已包含全部后端，直接使用即可（见[安装](#0-直接用-release-预编译包推荐x86_64)）。
@@ -79,13 +79,15 @@ GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通�
 
 X11 会话默认把所有显示器拼成一张画面。设置 `UU_X11_MULTISCREEN=1` 后，主机按 `xrandr --listmonitors` 列出各个显示器，控制端可选择其中一块，只采集该区域，绝对鼠标坐标加上该屏幕在桌面中的偏移；默认屏幕为主显示器，`UU_X11_OUTPUT` 可指定其他屏幕（如 `HDMI-1`）。显示器布局在主机启动时读取，改动后需重启服务。此模式下控制端的「分辨率」改为缩放画面，不再修改显示模式。实验性：目前只有单元测试与 Xvfb 虚拟显示器实测，尚未经官方客户端实机验收。
 
-切屏复用同一条视频轨道，过渡期间暂停输入，发送新屏首帧后恢复；采集或编码失败、等待首帧超时会请求恢复原屏。当前通过 `hyprctl` 枚举未旋转的显示器，显示器插拔或布局变化后需重启服务。已在 Omarchy / Hyprland 上用官方手机客户端实测 2560×1440（125%）与 1920×1080（133.33%）双屏切换及点击。
+切屏复用同一条视频轨道，过渡期间暂停输入，发送新屏首帧后恢复；采集或编码失败、等待首帧超时会请求恢复原屏。Hyprland 通过 `hyprctl` 枚举未旋转的显示器，显示器插拔或布局变化后需重启服务。已在 Omarchy / Hyprland 上用官方手机客户端实测 2560×1440（125%）与 1920×1080（133.33%）双屏切换及点击。
+
+niri 会话通过 `niri msg --json outputs` 枚举已启用的显示器。普通及 90°/180°/270° 旋转输出仅在 `NIRI_SOCKET` 存在时启用；镜像变换暂不支持。三屏切换、90° 竖屏画面与点击，以及手机向 Codex 输入中文已在 CachyOS + niri 实测。其他合成器继续拒绝旋转输出，保留原有文本输入路径。显示器布局变化后需重启服务。
 
 ## 尚未实现 / 不支持
 
 | 功能 | 状态 |
 |---|---|
-| 多显示器切换 | Hyprland 原生 Wayland 后端与 X11（`UU_X11_MULTISCREEN=1`）实验性支持，见上文 |
+| 多显示器切换 | niri / Hyprland 原生 Wayland 后端与 X11（`UU_X11_MULTISCREEN=1`）实验性支持，见上文 |
 | 真彩（4:4:4） | 支持（v0.1.15）：NVENC / libx264 的默认 FFmpeg 管线输出 H.264 High 4:4:4；`inproc-av` 原生 NVENC 输出 H.264 High 4:4:4 / HEVC FRExt；VAAPI 管线仍为 4:2:0，并如实回报给客户端 |
 | HDR | 未实现 |
 | 超级屏 / 虚拟显示器 | 未实现 |
@@ -292,7 +294,7 @@ systemctl --user restart uuremote-native.service
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms`（实验性特性） / `none`（无头模式） |
 | `UU_DESKTOP_RESIZE=0` | X11 下控制端切换分辨率时不改桌面分辨率，只缩放编码画面 |
 | `UU_NVENC_RGB=0` / `=1` | NVENC 直接编码 BGRA（省 CPU）。显示器接在 NVIDIA 卡上时默认关闭（同卡合成时直吃反而更慢），`0` 强制关，`1` 强制开 |
-| `UU_WAYLAND_MULTISCREEN=1` | 启用 Hyprland 物理显示器切换（默认关闭） |
+| `UU_WAYLAND_MULTISCREEN=1` | 启用 Hyprland / niri 物理显示器切换（默认关闭） |
 | `UU_WAYLAND_OUTPUT` | 原生 Wayland 默认采集输出名称，例如 `HDMI-A-1` |
 | `UU_X11_MULTISCREEN=1` | X11 下按显示器分别选择和采集（实验性，默认关闭，需要 `xrandr`） |
 | `UU_X11_OUTPUT` | X11 默认采集的显示器名称（`xrandr --listmonitors`），默认主显示器 |

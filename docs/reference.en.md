@@ -47,7 +47,7 @@ authorized session. Independent file/terminal tool peers do not reset input.
 | Xfce | X11 | ✅ Tested in a VM | default |
 | Cinnamon / MATE | X11 | ✅ Tested in a VM | default |
 | Hyprland | Wayland (native wlroots protocols) | 🧪 Experimental, tested in a VM (some features limited, see below) | `--features wayland` |
-| niri | Wayland (native wlroots protocols) | 🧪 Experimental; protocol support confirmed from niri sources, not yet tested on hardware (#55) | `--features wayland` |
+| niri | Wayland (native wlroots protocols) | 🧪 Experimental; capture, text input and portrait switching hardware-tested; other features pending (#55) | `--features wayland` |
 | GNOME / KDE Plasma | Wayland (xdg-desktop-portal) | 🧪 Experimental; validation scope and limits below | `--features wayland,portal` |
 
 The GNOME Wayland Portal/EIS path has been checked for video and mouse/keyboard input on Ubuntu 26.04, GNOME 50, with one 4K screen at 200% scale; auto unlock after a cold locked connection is verified with the official Mac and iPhone 4.42.0 viewers, while other lock recovery and reconnection still need hardware acceptance testing. Apart from that path and GNOME on X11, desktop testing has primarily used virtual machines. If something goes wrong on
@@ -90,11 +90,13 @@ X11 sessions send all monitors as one combined picture by default. With `UU_X11_
 
 Switching reuses one video track and pauses input until the new source sends a frame. Capture/encoder failure or a first-frame timeout requests restoration of the previous source. The inventory uses `hyprctl` and supports unrotated outputs; restart the host after monitor hotplug or layout changes. Phone-side switching and clicks were tested on Omarchy / Hyprland with 2560×1440 at 125% and 1920×1080 at 133.33%.
 
+On niri, `niri msg --json outputs` enumerates enabled monitors. Normal and 90/180/270-degree capture and pointer transforms are enabled only with `NIRI_SOCKET`; reflected transforms are excluded. Three-output switching, 90-degree portrait capture/click alignment, and mobile Chinese input into Codex were hardware-tested on CachyOS + niri. Other compositors retain their existing text path and reject rotated outputs. Restart after layout changes. The temporary printable-key text keyboard is niri-only; the Hyprland fast path and pristine-keymap restoration are unchanged.
+
 ## Not implemented / not supported
 
 | Feature | Status |
 |---|---|
-| Switching between multiple monitors | Experimental on native Hyprland Wayland and on X11 (`UU_X11_MULTISCREEN=1`); see above |
+| Switching between multiple monitors | Experimental on native niri / Hyprland Wayland and on X11 (`UU_X11_MULTISCREEN=1`); see above |
 | True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; `inproc-av` native NVENC encodes H.264 High 4:4:4 / HEVC FRExt; VAAPI stays 4:2:0 and reports that to the client |
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |
