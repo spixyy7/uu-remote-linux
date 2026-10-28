@@ -59,6 +59,33 @@ impl Refresh {
     }
 }
 /// Mainland mobile numbers are shown like the official client: 186******08.
+/// Local copy of the account picture (owner-only, like the viewer's device previews).
+fn avatar_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from).filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(base.join("uuremote").join("avatar"))
+}
+async fn fetch_avatar(url: &str) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let response = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()
+        .map_err(|_| "client setup failed")?.get(url).send().await.map_err(|_| "download failed")?;
+    if !response.status().is_success() { return Err(format!("HTTP {}", response.status().as_u16())); }
+    if !response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with("image/")) {
+        return Err("not an image".into());
+    }
+    let bytes = response.bytes().await.map_err(|_| "download failed")?;
+    if bytes.is_empty() || bytes.len() > 4 * 1024 * 1024 { return Err("unexpected size".into()); }
+    let path = avatar_path().ok_or("no cache directory")?;
+    let dir = path.parent().ok_or("no cache directory")?;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|_| "cache directory unavailable")?;
+    let temp = dir.join(".avatar.tmp");
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&temp).map_err(|_| "cache write failed")?;
+    file.write_all(&bytes).map_err(|_| "cache write failed")?;
+    std::fs::rename(&temp, &path).map_err(|_| "cache write failed")?;
+    Ok(path)
+}
+
 pub fn display_account(name: &str) -> String {
     if name.len() == 11 && name.bytes().all(|b| b.is_ascii_digit()) { format!("{}******{}", &name[..3], &name[9..]) } else { name.to_owned() }
 }
@@ -75,6 +102,7 @@ extern "C" {
     fn uu_assist_ui_start(hidden: libc::c_int, hide_on_close: libc::c_int) -> libc::c_int;
     fn uu_assist_ui_present();
     fn uu_ui_set_user(name: *const libc::c_char);
+    fn uu_ui_set_avatar(path: *const libc::c_char);
     fn uu_assist_ui_set(id: *const libc::c_char, code: *const libc::c_char, allowed: libc::c_int, verify: libc::c_int, refresh: libc::c_int, has_custom: libc::c_int);
     fn uu_assist_ui_take_command(arg: *mut libc::c_char, len: libc::size_t) -> libc::c_int;
     fn uu_assist_ui_close();
@@ -133,6 +161,15 @@ impl LocalUi {
         #[cfg(uu_gtk)]
         if matches!(self, Self::Window) { let name = std::ffi::CString::new(name).unwrap_or_default(); unsafe { uu_ui_set_user(name.as_ptr()) } }
         #[cfg(not(uu_gtk))] let _ = name;
+    }
+    /// Account card picture; None restores the drawn placeholder.
+    pub fn set_avatar(&self, path: Option<&std::path::Path>) {
+        #[cfg(uu_gtk)]
+        if matches!(self, Self::Window) {
+            let path = std::ffi::CString::new(path.and_then(|p| p.to_str()).unwrap_or_default()).unwrap_or_default();
+            unsafe { uu_ui_set_avatar(path.as_ptr()) }
+        }
+        #[cfg(not(uu_gtk))] let _ = path;
     }
     pub fn present(&self) {
         #[cfg(uu_gtk)]
@@ -345,26 +382,40 @@ impl Assist {
         Ok(this)
     }
     pub fn is_account(&self) -> bool { self.account }
-    /// Logged-in host: account name for the account card (saved at login, else /api/v1/user/info).
+    /// Logged-in host: account name and picture for the account card (name saved at login,
+    /// else /api/v1/user/info, which also carries the picture URL).
     pub async fn load_account_name(&self) {
         let saved = crate::config::read_fresh().ok().flatten()
             .and_then(|c| c.get("account_name").and_then(Value::as_str).map(str::to_owned)).filter(|n| !n.is_empty());
-        let name = match saved {
-            Some(name) => name,
-            None => match self.client.assist_get("/api/v1/user/info").await {
-                Ok((200, v)) => v.get("data").and_then(|d| ["nickname", "mobile", "phone"].iter()
-                    .find_map(|k| d.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned)))
-                    .unwrap_or_else(|| self.device.user_id.clone()),
-                _ => self.device.user_id.clone(),
-            },
+        let info = match self.client.assist_get("/api/v1/user/info").await {
+            Ok((200, v)) => v.get("data").cloned(),
+            _ => None,
         };
+        if let Some(fields) = info.as_ref().and_then(Value::as_object) {
+            // Field names only: values are account data.
+            log::info!("Account info fields: {:?}", fields.keys().take(32).collect::<Vec<_>>());
+        }
+        let name = saved.unwrap_or_else(|| info.as_ref().and_then(|d| ["nickname", "mobile", "phone"].iter()
+            .find_map(|k| d.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned)))
+            .unwrap_or_else(|| self.device.user_id.clone()));
         self.ui.set_user(&display_account(&name));
+        let url = info.as_ref().and_then(|d| ["avatar", "avatar_url", "head_url", "head_img", "headimg", "portrait", "icon", "photo"].iter()
+            .find_map(|k| d.get(*k).and_then(Value::as_str).filter(|u| u.starts_with("https://")).map(str::to_owned)));
+        match url {
+            Some(url) => match fetch_avatar(&url).await {
+                Ok(path) => { log::info!("Account picture loaded"); self.ui.set_avatar(Some(&path)); },
+                Err(error) => log::warn!("Account picture unavailable: {error}"),
+            },
+            None => log::info!("Account picture: none on the account"),
+        }
     }
     /// Sign out: official /api/v1/user/logout (best effort), withdraw the share, drop local credentials.
     pub async fn logout(&mut self) {
         let _ = self.client.assist_post("/api/v1/user/logout", None).await;
         let _ = self.cancel().await;
         self.save_many(&[("token", Value::Null), ("csrf", Value::Null), ("user_id", Value::Null), ("account_name", Value::Null)]);
+        if let Some(path) = avatar_path() { let _ = std::fs::remove_file(path); }
+        self.ui.set_avatar(None);
         log::info!("Signed out; restarting without an account");
     }
     pub fn ui(&self) -> std::sync::Arc<LocalUi> { self.ui.clone() }

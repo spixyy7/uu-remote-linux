@@ -198,9 +198,27 @@ static void on_destroy(GtkWidget *w, gpointer d) {
     gtk_main_quit();
 }
 
+static GdkPixbuf *avatar_image;
+static GtkWidget *avatar_area;
+/* The account's own picture, centre-cropped into the circle; the drawn person otherwise. */
+static void draw_avatar_image(cairo_t *cr, double s) {
+    int w = gdk_pixbuf_get_width(avatar_image), h = gdk_pixbuf_get_height(avatar_image);
+    double scale = s / (w < h ? w : h);
+    cairo_save(cr);
+    cairo_arc(cr, s / 2, s / 2, s / 2, 0, 2 * G_PI); cairo_clip(cr);
+    cairo_translate(cr, (s - w * scale) / 2, (s - h * scale) / 2);
+    cairo_scale(cr, scale, scale);
+    gdk_cairo_set_source_pixbuf(cr, avatar_image, 0, 0);
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
+    cairo_paint(cr);
+    cairo_restore(cr);
+    cairo_arc(cr, s / 2, s / 2, s / 2 - 0.5, 0, 2 * G_PI);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0.12); cairo_set_line_width(cr, 1); cairo_stroke(cr);
+}
 static gboolean draw_avatar(GtkWidget *w, cairo_t *cr, gpointer d) {
     (void)w; (void)d;
     double s = 64;
+    if (avatar_image) { draw_avatar_image(cr, s); return TRUE; }
     cairo_arc(cr, s / 2, s / 2, s / 2 - 1, 0, 2 * G_PI);
     cairo_set_source_rgb(cr, 0.84, 0.90, 1.0); cairo_fill_preserve(cr);
     cairo_set_source_rgb(cr, 0.36, 0.55, 1.0); cairo_set_line_width(cr, 2); cairo_stroke(cr);
@@ -270,7 +288,7 @@ static GtkWidget *build_account_card(void) {
     // Signed in: avatar + account name + logout.
     GtkWidget *user_page = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
     gtk_container_set_border_width(GTK_CONTAINER(user_page), 20);
-    GtkWidget *avatar = gtk_drawing_area_new();
+    GtkWidget *avatar = avatar_area = gtk_drawing_area_new();
     gtk_widget_set_size_request(avatar, 64, 64);
     gtk_widget_set_valign(avatar, GTK_ALIGN_CENTER);
     g_signal_connect(avatar, "draw", G_CALLBACK(draw_avatar), NULL);
@@ -704,6 +722,20 @@ static gboolean apply_user(gpointer data) {
     }
     g_free(data);
     return G_SOURCE_REMOVE;
+}
+static gboolean apply_avatar(gpointer data) {
+    /* Loaded at 2x so the 64 px circle stays sharp on HiDPI screens. */
+    GdkPixbuf *image = data && *(char *)data ? gdk_pixbuf_new_from_file_at_scale(data, 128, 128, TRUE, NULL) : NULL;
+    g_free(data);
+    if (avatar_image) g_object_unref(avatar_image);
+    avatar_image = image;
+    if (window && avatar_area) gtk_widget_queue_draw(avatar_area);
+    return G_SOURCE_REMOVE;
+}
+// Account picture file (empty: back to the drawn person).
+void uu_ui_set_avatar(const char *path) {
+    if (!ui_started || init_state != 1) return;
+    g_idle_add(apply_avatar, g_strdup(path ? path : ""));
 }
 // Signed in: show the user page with this (already masked) account name.
 void uu_ui_set_user(const char *name) {
