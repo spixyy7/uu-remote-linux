@@ -120,5 +120,5 @@ jobs:
           build-args: VERSION=${{ github.ref_name }}
           push: true
           tags: |
-            ghcr.io/vallierdev/uu-remote-linux:${{ github.ref_name }}
-            ghcr.io/vallierdev/uu-remote-linux:latest
+            ghcr.io/spixyy7/uu-remote-linux:${{ github.ref_name }}
+            ghcr.io/spixyy7/uu-remote-linux:latest

@@ -37,7 +37,7 @@ cat > "$pkg/DEBIAN/control" <<CONTROL
 Package: uu-remote-linux
 Version: $version
 Architecture: $arch
-Maintainer: VallierDev <24893073+VallierDev@users.noreply.github.com>
+Maintainer: spixyy7 <spixyy7@users.noreply.github.com>
 Installed-Size: $size
 Depends: $depends, ffmpeg
 Recommends: ${recommends:+$recommends, }libwayland-client0, libxkbcommon0
