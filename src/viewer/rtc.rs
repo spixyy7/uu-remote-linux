@@ -4,8 +4,14 @@ use std::sync::{Arc,atomic::{AtomicBool,AtomicU32,AtomicU64,Ordering}};
 use tokio::sync::mpsc;
 use webrtc::{api::{APIBuilder,media_engine::MediaEngine,setting_engine::SettingEngine}, peer_connection::{RTCPeerConnection,configuration::RTCConfiguration,sdp::session_description::RTCSessionDescription,policy::ice_transport_policy::RTCIceTransportPolicy}, ice_transport::{ice_server::RTCIceServer,ice_candidate::RTCIceCandidateInit}, data_channel::{RTCDataChannel,data_channel_init::RTCDataChannelInit}, rtp_transceiver::{rtp_codec::RTPCodecType,rtp_transceiver_direction::RTCRtpTransceiverDirection,RTCRtpTransceiverInit}};
 
+/// TURN over TCP (`?transport=tcp`) or TLS (`turns:`); STUN and UDP TURN are dropped.
+fn tcp_relay_urls(urls:Vec<String>)->Vec<String>{urls.into_iter().filter(|u|u.starts_with("turns:")||(u.starts_with("turn:")&&u.contains("transport=tcp"))).collect()}
 pub fn configuration(result:&Value)->Result<RTCConfiguration,String> {
     let list=result.get("iceServers").and_then(Value::as_array).ok_or("Control acknowledgement missing iceServers")?;
+    // UU_VIEWER_RELAY=tcp: relay only over the cloud's TURN TCP/TLS entries (vendor/webrtc-ice turn_tcp,
+    // dialed directly). Some international UDP paths lose ~10% of packets where TCP does not.
+    let tcp=std::env::var("UU_VIEWER_RELAY").is_ok_and(|v|v.eq_ignore_ascii_case("tcp"));
+    if tcp {webrtc::ice::agent::turn_tcp::set_relay_transport(Default::default());}
     let mut servers=Vec::new();
     for server in list {
         let urls=match server.get("urls") {
@@ -14,12 +20,14 @@ pub fn configuration(result:&Value)->Result<RTCConfiguration,String> {
             _=>return Err("Invalid ICE URLs".into()),
         };
         if urls.is_empty() || urls.iter().any(|u| !["stun:","stuns:","turn:","turns:"].iter().any(|p|u.starts_with(p))) {return Err("Invalid ICE URL scheme".into())}
+        let urls=if tcp {tcp_relay_urls(urls)}else{urls};
+        if urls.is_empty() {continue}
         let string=|key|match server.get(key) {Some(Value::String(s))=>Ok(s.clone()),None=>Ok(String::new()),_=>Err("Invalid ICE authentication")};
         // webrtc-rs rejects TURN unless the credential type is Password (as in the host's session_ice.rs).
         servers.push(RTCIceServer { urls,username:string("username")?,credential:string("credential")?,
             credential_type:webrtc::ice_transport::ice_credential_type::RTCIceCredentialType::Password });
     }
-    let relay=match result.get("force_relay") {None=>false,Some(Value::Bool(b))=>*b,_=>return Err("Invalid relay policy".into())};
+    let relay=tcp||match result.get("force_relay") {None=>false,Some(Value::Bool(b))=>*b,_=>return Err("Invalid relay policy".into())};
     if relay && !servers.iter().any(|s|s.urls.iter().any(|u|u.starts_with("turn:")||u.starts_with("turns:"))) {return Err("Relay-only session without TURN".into())}
     // An empty cloud list means host candidates only. Never invent public STUN.
     Ok(RTCConfiguration{ice_servers:servers,ice_transport_policy:if relay{RTCIceTransportPolicy::Relay}else{RTCIceTransportPolicy::All},..Default::default()})
@@ -346,6 +354,10 @@ fn answer_sdp(body:&Value)->Result<String,String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn tcp_relay_keeps_only_turn_over_tcp_or_tls(){
+        let urls=["stun:a:3478","turn:a:3478","turn:a:3478?transport=udp","turn:a:443?transport=tcp","turns:a:443?transport=tcp"].map(String::from).to_vec();
+        assert_eq!(tcp_relay_urls(urls),["turn:a:443?transport=tcp","turns:a:443?transport=tcp"]);
+    }
     #[test]
     fn compressed_answers_are_supported_and_bounded() {
         use base64::Engine;use std::io::Write;
