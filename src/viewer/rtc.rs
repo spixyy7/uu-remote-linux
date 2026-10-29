@@ -4,8 +4,14 @@ use std::sync::{Arc,atomic::{AtomicBool,AtomicU32,AtomicU64,Ordering}};
 use tokio::sync::mpsc;
 use webrtc::{api::{APIBuilder,media_engine::MediaEngine,setting_engine::SettingEngine}, peer_connection::{RTCPeerConnection,configuration::RTCConfiguration,sdp::session_description::RTCSessionDescription,policy::ice_transport_policy::RTCIceTransportPolicy}, ice_transport::{ice_server::RTCIceServer,ice_candidate::RTCIceCandidateInit}, data_channel::{RTCDataChannel,data_channel_init::RTCDataChannelInit}, rtp_transceiver::{rtp_codec::RTPCodecType,rtp_transceiver_direction::RTCRtpTransceiverDirection,RTCRtpTransceiverInit}};
 
+/// TURN over TCP (`?transport=tcp`) or TLS (`turns:`); STUN and UDP TURN are dropped.
+fn tcp_relay_urls(urls:Vec<String>)->Vec<String>{urls.into_iter().filter(|u|u.starts_with("turns:")||(u.starts_with("turn:")&&u.contains("transport=tcp"))).collect()}
 pub fn configuration(result:&Value)->Result<RTCConfiguration,String> {
     let list=result.get("iceServers").and_then(Value::as_array).ok_or("Control acknowledgement missing iceServers")?;
+    // UU_VIEWER_RELAY=tcp: relay only over the cloud's TURN TCP/TLS entries (vendor/webrtc-ice turn_tcp,
+    // dialed directly). Some international UDP paths lose ~10% of packets where TCP does not.
+    let tcp=std::env::var("UU_VIEWER_RELAY").is_ok_and(|v|v.eq_ignore_ascii_case("tcp"));
+    if tcp {webrtc::ice::agent::turn_tcp::set_relay_transport(Default::default());}
     let mut servers=Vec::new();
     for server in list {
         let urls=match server.get("urls") {
@@ -14,12 +20,14 @@ pub fn configuration(result:&Value)->Result<RTCConfiguration,String> {
             _=>return Err("Invalid ICE URLs".into()),
         };
         if urls.is_empty() || urls.iter().any(|u| !["stun:","stuns:","turn:","turns:"].iter().any(|p|u.starts_with(p))) {return Err("Invalid ICE URL scheme".into())}
+        let urls=if tcp {tcp_relay_urls(urls)}else{urls};
+        if urls.is_empty() {continue}
         let string=|key|match server.get(key) {Some(Value::String(s))=>Ok(s.clone()),None=>Ok(String::new()),_=>Err("Invalid ICE authentication")};
         // webrtc-rs rejects TURN unless the credential type is Password (as in the host's session_ice.rs).
         servers.push(RTCIceServer { urls,username:string("username")?,credential:string("credential")?,
             credential_type:webrtc::ice_transport::ice_credential_type::RTCIceCredentialType::Password });
     }
-    let relay=match result.get("force_relay") {None=>false,Some(Value::Bool(b))=>*b,_=>return Err("Invalid relay policy".into())};
+    let relay=tcp||match result.get("force_relay") {None=>false,Some(Value::Bool(b))=>*b,_=>return Err("Invalid relay policy".into())};
     if relay && !servers.iter().any(|s|s.urls.iter().any(|u|u.starts_with("turn:")||u.starts_with("turns:"))) {return Err("Relay-only session without TURN".into())}
     // An empty cloud list means host candidates only. Never invent public STUN.
     Ok(RTCConfiguration{ice_servers:servers,ice_transport_policy:if relay{RTCIceTransportPolicy::Relay}else{RTCIceTransportPolicy::All},..Default::default()})
@@ -40,6 +48,10 @@ pub struct Observed {
     pub media_bytes:AtomicU64,
     pub video_received:AtomicU64,
     pub video_expected:AtomicU64,
+    /// Selected ICE pair round trip, refreshed by `route`; the video receiver waits about that long for NACKed packets.
+    pub rtt_ms:AtomicU32,
+    /// `media::Receiver::recovery` of the video track.
+    pub video_recovery:[AtomicU64;3],
 }
 pub struct Peer {
     clipboard:super::clipboard::Bridge,
@@ -67,7 +79,7 @@ fn media_engine(shape:&Shape)->Result<MediaEngine,String>{
     }Ok(engine)
 }
 impl Peer {
-    pub async fn new(config:RTCConfiguration, shape:&Shape, app_id:&str, ice_id:&str, remote_client:&str, outbound:mpsc::Sender<Value>, settings:SettingEngine, mut clipboard:super::clipboard::Bridge)->Result<Self,String> {
+    pub async fn new(config:RTCConfiguration, shape:&Shape, app_id:&str, ice_id:&str, remote_client:&str, outbound:mpsc::Sender<Value>, mut settings:SettingEngine, mut clipboard:super::clipboard::Bridge)->Result<Self,String> {
         shape.validate_session()?;
         let mut engine=media_engine(shape)?;
         // UU RTP metadata the official Mac viewer offers (src/rtp_metadata.rs on the host side).
@@ -75,6 +87,9 @@ impl Peer {
             engine.register_header_extension(webrtc::rtp_transceiver::rtp_codec::RTCRtpHeaderExtensionCapability{uri:uri.into()},RTPCodecType::Video,None).map_err(|_|"RTP header extension registration failed")?;
         }
         let registry=webrtc::api::interceptor_registry::register_default_interceptors(webrtc::interceptor::registry::Registry::new(),&mut engine).map_err(|_|"RTP interceptor initialization failed")?;
+        // A NACKed copy arrives about one RTT after the original; the default 64-packet SRTP replay window
+        // (~160 ms at 1080p) rejects it as a replay. 1024 matches libwebrtc's SRTP policy.
+        settings.set_srtp_replay_protection_window(1024);
         let api=APIBuilder::new().with_media_engine(engine).with_setting_engine(settings).with_interceptor_registry(registry).build();
         let pc=Arc::new(api.new_peer_connection(config).await.map_err(|e|format!("Peer creation failed: {}",crate::auth::transport_error(&e)))?);
         let tools:super::tools::Inbox=Arc::new(std::sync::Mutex::new(None));
@@ -146,7 +161,8 @@ impl Peer {
                             },
                             Err(_)=>break,
                         },
-                        _=tick.tick()=>{if !video {continue} receiver.expire()},
+                        _=tick.tick()=>{if !video {continue} receiver.set_rtt(counters.rtt_ms.load(Ordering::Relaxed));
+                            for (n,v) in receiver.recovery.iter().enumerate(){counters.video_recovery[n].store(*v,Ordering::Relaxed);}receiver.expire()},
                     };
                     if output.pli {desktop.reset.store(true,Ordering::Release);desktop.pli.store(true,Ordering::Release);}
                     for au in output.units {if desktop.units.push(super::media::AccessUnit{codec:receiver.codec(),data:au}) {desktop.reset.store(true,Ordering::Release);desktop.pli.store(true,Ordering::Release);}}
@@ -279,6 +295,8 @@ impl Peer {
             Some("answer")=> {
                 if self.answered {return Ok(())}
                 let sdp=answer_sdp(body)?;
+                // Booleans only: whether the host takes part in loss recovery and congestion feedback.
+                log::info!("Viewer answer video feedback: nack={} pli={} rtx={} transport_cc={}",sdp.contains(" nack\r")||sdp.contains(" nack\n"),sdp.contains("nack pli"),sdp.contains(" rtx/"),sdp.contains("transport-cc"));
                 let answer=RTCSessionDescription::answer(sdp).map_err(|_|"Invalid answer")?;
                 self.pc.set_remote_description(answer).await.map_err(|_|"Set remote answer failed")?;
                 self.answered=true;
@@ -301,6 +319,12 @@ impl Peer {
         !body.get("ice_id").is_some_and(|v|v.as_str()!=Some(self.ice_id.as_str()))
             && !body.get("app_control_id").is_some_and(|v|v.as_str()!=Some(self.app_id.as_str()))
             && !event.get("client_id").is_some_and(|v|v.as_str()!=Some(self.remote_client.as_str()))
+    }
+    /// For each route field matches_route checks: absent, same or other (no values).
+    pub fn route_comparison(&self,event:&Value)->String {
+        let body=event.get("data").unwrap_or(event);
+        let cmp=|v:Option<&Value>,ours:&str|match v {None=>"absent",Some(v) if v.as_str()==Some(ours)=>"same",_=>"other"};
+        format!("ice_id={} app_control_id={} client_id={}",cmp(body.get("ice_id"),&self.ice_id),cmp(body.get("app_control_id"),&self.app_id),cmp(event.get("client_id"),&self.remote_client))
     }
     pub fn ready(&self,policy:ReadyPolicy,explicit:bool)->bool {
         self.observed.echo_received.load(Ordering::Acquire) && match policy {ReadyPolicy::EchoOnly=>true,ReadyPolicy::Explicit=>explicit}
@@ -327,6 +351,7 @@ impl Peer {
         let relay=[local,remote].iter().flatten().any(|c|c.candidate_type==webrtc::ice::candidate::CandidateType::Relay);
         let tcp=local.is_some_and(|c|c.network_type.to_string().to_ascii_lowercase().contains("tcp") || c.relay_protocol.eq_ignore_ascii_case("tcp"));
         let rtt=(pair.current_round_trip_time>0.).then(||(pair.current_round_trip_time*1000.).round() as u32);
+        self.observed.rtt_ms.store(rtt.unwrap_or(0),Ordering::Relaxed);
         (rtt,format!("{} · {}",if tcp{"TCP"}else{"UDP"},if relay{"relay"}else{"direct"}))
     }
     pub async fn close(&self) {self.clipboard.stop();self.tools.lock().unwrap().take();let _=self.pc.close().await;}
@@ -346,6 +371,10 @@ fn answer_sdp(body:&Value)->Result<String,String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn tcp_relay_keeps_only_turn_over_tcp_or_tls(){
+        let urls=["stun:a:3478","turn:a:3478","turn:a:3478?transport=udp","turn:a:443?transport=tcp","turns:a:443?transport=tcp"].map(String::from).to_vec();
+        assert_eq!(tcp_relay_urls(urls),["turn:a:443?transport=tcp","turns:a:443?transport=tcp"]);
+    }
     #[test]
     fn compressed_answers_are_supported_and_bounded() {
         use base64::Engine;use std::io::Write;

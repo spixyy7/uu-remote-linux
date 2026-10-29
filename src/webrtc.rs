@@ -1336,6 +1336,10 @@ impl WebRtcSession {
                                             log::info!("SimpleAction {} ({}) not handled: args={}", action, crate::control_protocol::simple_action_name(action).unwrap_or("?"), sa::args_shape(args));
                                         }
                                         if action == 0 {
+                                            // The viewer's own FeatureFlag (field 4): which feature versions it would use (numbers only).
+                                            let flags: Option<Vec<(u32, u64)>> = action_fields.iter().find_map(|f| match (&f.value, f.number) { (WireValue::Bytes(v), 4) => crate::protocol::decode_wire(v).ok(), _ => None })
+                                                .map(|fields| fields.iter().filter_map(|f| match f.value { WireValue::Varint(v) => Some((f.number, v)), _ => None }).collect());
+                                            log::info!("Viewer feature flags: {:?} action_fields={:?}", flags, action_fields.iter().map(|f| f.number).collect::<Vec<_>>());
                                             echo_for_message.store(seq, std::sync::atomic::Ordering::Release);
                                             echo_seen_for_message.store(true, std::sync::atomic::Ordering::Release);
                                             let response = crate::control_protocol::encode_echo_response_with_clipboard(
