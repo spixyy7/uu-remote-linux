@@ -40,6 +40,8 @@ pub struct Observed {
     pub media_bytes:AtomicU64,
     pub video_received:AtomicU64,
     pub video_expected:AtomicU64,
+    /// Selected ICE pair round trip, refreshed by `route`; the video receiver waits about that long for NACKed packets.
+    pub rtt_ms:AtomicU32,
 }
 pub struct Peer {
     clipboard:super::clipboard::Bridge,
@@ -146,7 +148,7 @@ impl Peer {
                             },
                             Err(_)=>break,
                         },
-                        _=tick.tick()=>{if !video {continue} receiver.expire()},
+                        _=tick.tick()=>{if !video {continue} receiver.set_rtt(counters.rtt_ms.load(Ordering::Relaxed));receiver.expire()},
                     };
                     if output.pli {desktop.reset.store(true,Ordering::Release);desktop.pli.store(true,Ordering::Release);}
                     for au in output.units {if desktop.units.push(super::media::AccessUnit{codec:receiver.codec(),data:au}) {desktop.reset.store(true,Ordering::Release);desktop.pli.store(true,Ordering::Release);}}
@@ -279,6 +281,8 @@ impl Peer {
             Some("answer")=> {
                 if self.answered {return Ok(())}
                 let sdp=answer_sdp(body)?;
+                // Booleans only: whether the host takes part in loss recovery and congestion feedback.
+                log::info!("Viewer answer video feedback: nack={} pli={} rtx={} transport_cc={}",sdp.contains(" nack\r")||sdp.contains(" nack\n"),sdp.contains("nack pli"),sdp.contains(" rtx/"),sdp.contains("transport-cc"));
                 let answer=RTCSessionDescription::answer(sdp).map_err(|_|"Invalid answer")?;
                 self.pc.set_remote_description(answer).await.map_err(|_|"Set remote answer failed")?;
                 self.answered=true;
@@ -327,6 +331,7 @@ impl Peer {
         let relay=[local,remote].iter().flatten().any(|c|c.candidate_type==webrtc::ice::candidate::CandidateType::Relay);
         let tcp=local.is_some_and(|c|c.network_type.to_string().to_ascii_lowercase().contains("tcp") || c.relay_protocol.eq_ignore_ascii_case("tcp"));
         let rtt=(pair.current_round_trip_time>0.).then(||(pair.current_round_trip_time*1000.).round() as u32);
+        self.observed.rtt_ms.store(rtt.unwrap_or(0),Ordering::Relaxed);
         (rtt,format!("{} · {}",if tcp{"TCP"}else{"UDP"},if relay{"relay"}else{"direct"}))
     }
     pub async fn close(&self) {self.clipboard.stop();self.tools.lock().unwrap().take();let _=self.pc.close().await;}

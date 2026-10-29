@@ -20,13 +20,23 @@ pub struct Receiver {
     codec: Codec,
     next: Option<u16>, pending: Vec<Packet>, timestamp: Option<u32>,
     au: Vec<u8>, fragment: Option<u16>, damaged: bool, gap_since:Option<Instant>, last_packet:Instant,
+    /// How long a sequence gap may wait for a retransmission, and how many packets may queue behind it.
+    patience:Duration, window:usize,
 }
 impl Default for Receiver {
-    fn default() -> Self { Self { codec: Codec::H264, next: None, pending: Vec::new(), timestamp: None, au: Vec::new(), fragment: None, damaged: false, gap_since:None,last_packet:Instant::now() } }
+    fn default() -> Self { Self { codec: Codec::H264, next: None, pending: Vec::new(), timestamp: None, au: Vec::new(), fragment: None, damaged: false, gap_since:None,last_packet:Instant::now(),
+        patience:Duration::from_millis(40), window:32 } }
 }
 impl Receiver {
     pub fn new(codec:Codec)->Self {Self{codec,..Self::default()}}
     pub fn codec(&self)->Codec {self.codec}
+    /// The NACK interceptor asks for a lost packet within its 100 ms interval and the copy returns one RTT
+    /// later; skipping the gap sooner throws the copy away and asks for a key frame instead (official viewers
+    /// NACK as well: the host logs their nack_packets). A key frame must fit in the queue behind a gap.
+    pub fn set_rtt(&mut self,rtt_ms:u32){
+        if rtt_ms==0 {return}
+        self.patience=Duration::from_millis((u64::from(rtt_ms)+150).clamp(40,600));self.window=1024;
+    }
     pub fn push(&mut self, p: Packet) -> Output {
         if p.payload.len()>65536 {return Output{units:Vec::new(),pli:true}}
         let next = *self.next.get_or_insert(p.seq);
@@ -35,7 +45,7 @@ impl Receiver {
         self.pending.push(p);
         let mut out = Output::default();
         self.drain(&mut out);
-        if self.pending.len() >= 32 { self.skip_gap(&mut out); }
+        if self.pending.len() >= self.window { self.skip_gap(&mut out); }
         if self.pending.is_empty(){self.gap_since=None;}else{self.gap_since.get_or_insert(Instant::now());}
         out
     }
@@ -45,10 +55,10 @@ impl Receiver {
     }
     fn expire_at(&mut self,now:Instant)->Output {
         let mut out=Output::default();
-        if self.gap_since.is_some_and(|since|now.duration_since(since)>=Duration::from_millis(40)) && !self.pending.is_empty() {
+        if self.gap_since.is_some_and(|since|now.duration_since(since)>=self.patience) && !self.pending.is_empty() {
             self.skip_gap(&mut out);self.gap_since=if self.pending.is_empty(){None}else{Some(now)};
         }
-        if !self.au.is_empty() && now.duration_since(self.last_packet)>=Duration::from_millis(200) {
+        if !self.au.is_empty() && now.duration_since(self.last_packet)>=self.patience.max(Duration::from_millis(200)) {
             self.au.clear();self.fragment=None;self.damaged=true;out.pli=true;
         }
         out
@@ -175,6 +185,17 @@ mod tests {
         assert!(!r.expire().pli);assert!(r.expire_at(Instant::now()+Duration::from_millis(201)).pli);
         let mut pli=false;for seq in 2..34{pli|=r.push(p(seq,seq as u32,true,&[0x65])).pli;}
         assert!(pli);assert!(r.pending.len()<32);
+    }
+    #[test] fn with_rtt_a_retransmitted_packet_completes_the_frame_without_a_key_frame_request() {
+        let mut r=Receiver::default();r.set_rtt(250);let start=Instant::now();
+        r.push(p(10,1,false,&[0x7c,0x85,1]));r.push(p(12,1,true,&[0x7c,0x45,3]));
+        assert!(!r.expire_at(start+Duration::from_millis(300)).pli,"waits for the copy");
+        let o=r.push(p(11,1,false,&[0x7c,5,2]));assert!(!o.pli);assert_eq!(o.units[0],vec![0,0,0,1,0x65,1,2,3]);
+        r.push(p(14,2,true,&[0x65]));let at=Instant::now();
+        assert!(!r.expire_at(at+Duration::from_millis(390)).pli);assert!(r.expire_at(at+Duration::from_millis(401)).pli,"gives up after RTT + 150 ms");
+        let mut r=Receiver::default();r.set_rtt(5000);r.set_rtt(0);
+        assert_eq!((r.patience,r.window),(Duration::from_millis(600),1024),"capped; an unknown RTT keeps the last value");
+        r.push(p(0,1,false,&[0x61]));for seq in 2..600{r.push(p(seq,seq as u32,true,&[0x65]));}assert_eq!(r.pending.len(),598,"a key frame fits behind a gap");
     }
     #[test] fn malformed_and_bounded() {
         for bytes in [vec![],vec![24,0,4,0x65],vec![0x7c,0xc5,1],vec![0xff]] {
