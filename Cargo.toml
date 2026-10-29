@@ -77,6 +77,8 @@ webrtc-dtls = { path = "vendor/webrtc-dtls" }
 webrtc = { path = "vendor/webrtc" }
 # TURN over TCP/TLS through an HTTP CONNECT proxy (vendor/webrtc-ice/PATCHES.md).
 webrtc-ice = { path = "vendor/webrtc-ice" }
+# Shorter SCTP retransmission timeout for ordered input on lossy relays (vendor/webrtc-sctp/PATCHES.md).
+webrtc-sctp = { path = "vendor/webrtc-sctp" }
 
 [[bench]]
 name = "nvenc_pipeline_bench"
