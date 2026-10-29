@@ -46,12 +46,35 @@ struct HeldInput { buttons: std::collections::BTreeSet<i32>, keys: std::collecti
 /// Held modifier VKs (bit 0 Ctrl, 1 Shift, 2 Alt, 3 Win) and keys that got a synthetic Shift.
 #[derive(Default)]
 struct Shortcuts { modifiers: u8, shifted: std::collections::BTreeSet<i32> }
+/// Mobile viewers in touch mode send a finger as a left-button drag at absolute positions (observed:
+/// Android sends press, a stream of mouse_move_absolute, release), which on a desktop selects text
+/// instead of scrolling. With the portal touchscreen granted those drags are replayed as one finger,
+/// so the desktop scrolls and taps as on a touch screen. `at` is the last absolute position; relative
+/// motion (the viewers' trackpad mode) clears it and keeps mouse buttons.
+#[derive(Default)]
+struct TouchDrag { mobile: bool, at: Option<(i32,i32)>, down: bool }
+/// Viewer platform from the connect header `controller_platform` (website enum: 1 windows, 2 android,
+/// 3 ios, 4 macos, 5 tv).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Controller { #[default] Other, Mac, Mobile }
+impl Controller {
+    pub fn from_platform(platform: Option<&serde_json::Value>) -> Self {
+        let Some(v) = platform else { return Self::Other };
+        let text = v.as_str().map(str::to_ascii_lowercase);
+        match v.as_i64().or_else(|| text.as_deref().and_then(|s| s.parse().ok())) {
+            Some(4) => Self::Mac,
+            Some(2 | 3) => Self::Mobile,
+            _ if text.is_some_and(|s| s.contains("mac") || s.contains("darwin")) => Self::Mac,
+            _ => Self::Other,
+        }
+    }
+}
 /// Mac viewer with 「使用 macOS 快捷键」 off sends Cmd as VK_LWIN (verified: Cmd 0x5B, Option 0xA4,
 /// Ctrl 0xA2). Cmd is held back until we know whether it starts a Mac shortcut.
 #[derive(Default)]
 struct CmdState { held: bool, pending: bool, passthrough: bool, combos: std::collections::BTreeMap<i32, bool> }
 
-pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput> }
+pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput>, touch: std::sync::Mutex<TouchDrag> }
 
 impl InputInjector {
     pub fn new() -> Self {
@@ -62,7 +85,7 @@ impl InputInjector {
                 Err(e) => { log::warn!("uinput unavailable ({}); using the desktop input path. See README for the udev rule.", e.kind()); None }
             }
         } else { None };
-        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::detect().unwrap_or(crate::desktop_backend::DesktopBackend::X11), pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()) }
+        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::detect().unwrap_or(crate::desktop_backend::DesktopBackend::X11), pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()), touch:std::sync::Mutex::new(TouchDrag::default()) }
     }
 
     pub fn bind_portal(&self,session:Option<std::sync::Arc<crate::portal::PortalSession>>) {
@@ -114,8 +137,15 @@ impl InputInjector {
         let mut pending = self.pending.lock().unwrap();
         let motion = std::mem::take(&mut *pending);
         pending.scroll = (motion.scroll.0 % 120, motion.scroll.1 % 120);
-        if let Some((x,y)) = motion.absolute { self.inject_move(x,y,false); }
-        if motion.relative != (0,0) { self.inject_move(motion.relative.0 as i32,motion.relative.1 as i32,true); }
+        if let Some((x,y)) = motion.absolute {
+            let mut touch = self.touch.lock().unwrap();
+            if touch.down { self.inject_touch(1,x,y); } else { self.inject_move(x,y,false); }
+            touch.at = Some((x,y));
+        }
+        if motion.relative != (0,0) {
+            self.touch.lock().unwrap().at = None;
+            self.inject_move(motion.relative.0 as i32,motion.relative.1 as i32,true);
+        }
         for (value, positive, negative) in [(motion.scroll.1,4,5),(motion.scroll.0,7,6)] {
             let count = value / 120;
             let button = if count > 0 { positive } else { negative };
@@ -136,6 +166,7 @@ impl InputInjector {
     pub fn mouse_button(&self, button: i32, is_press: bool) {
         let _serial=self.serial.lock().unwrap();
         self.flush_pointer_locked();
+        if button == 1 && self.touch_button(is_press) { return; }
         let result = self.inject_button(button,is_press);
         if result == 0 {
             let mut held = self.held.lock().unwrap();
@@ -174,10 +205,52 @@ impl InputInjector {
         shift
     }
 
-    /// The current desktop controller is the macOS viewer (connect header controller_platform).
-    pub fn set_mac_controller(&self, mac: bool) {
-        self.mac_controller.store(mac, std::sync::atomic::Ordering::Relaxed);
+    /// The current desktop controller's platform (connect header controller_platform).
+    /// `UU_TOUCH_INPUT=0` keeps mobile drags as mouse drags.
+    pub fn set_controller(&self, controller: Controller) {
+        self.mac_controller.store(controller == Controller::Mac, std::sync::atomic::Ordering::Relaxed);
         *self.cmd.lock().unwrap() = CmdState::default();
+        let mut touch = self.touch.lock().unwrap();
+        if touch.down { self.inject_touch(2,0,0); }
+        *touch = TouchDrag { mobile: controller == Controller::Mobile && std::env::var("UU_TOUCH_INPUT").as_deref() != Ok("0"), ..TouchDrag::default() };
+    }
+    /// Left button of a mobile controller: a finger down at the last absolute position, or up.
+    /// False leaves the button to the mouse path (no touchscreen, trackpad mode, other viewers).
+    fn touch_button(&self, pressed: bool) -> bool {
+        let mut touch = self.touch.lock().unwrap();
+        if !pressed {
+            if !touch.down { return false; }
+            touch.down = false;
+            self.inject_touch(2,0,0);
+            return true;
+        }
+        if touch.down { return true; }
+        let Some((x,y)) = touch.at.filter(|_| touch.mobile) else { return false };
+        let supported = self.backend == crate::desktop_backend::DesktopBackend::Portal
+            && self.portal.lock().unwrap().as_ref().is_some_and(|portal| portal.touch_supported());
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::info!("Mobile controller drag input: touchscreen={supported}");
+        }
+        if !supported { self.offer_touch_consent(); }
+        touch.down = supported && self.inject_touch(0,x,y) == 0;
+        touch.down
+    }
+    /// The portal offers a touchscreen the restored consent lacks: ask the host once per run, in the
+    /// background (GNOME's share dialog, visible to the phone too); drags stay mouse drags meanwhile.
+    fn offer_touch_consent(&self) {
+        static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let Some(portal) = self.portal.lock().unwrap().clone() else { return };
+        if ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) { return }
+        std::thread::spawn(move || match portal.upgrade_touch() {
+            Ok(true) => log::info!("Touch consent upgraded: mobile drags are touch from now on"),
+            Ok(false) => log::info!("Touch consent upgrade not needed or not offered by the portal"),
+            Err(reason) => log::info!("Touch consent upgrade not granted: {reason}"),
+        });
+    }
+    fn inject_touch(&self, phase: i32, x: i32, y: i32) -> i32 {
+        let Some(portal) = self.portal.lock().unwrap().clone() else { return -1 };
+        self.portal_result("touch", portal.touch(phase, f64::from(x), f64::from(y)))
     }
 
     fn terminal_focused(&self) -> bool {
@@ -269,6 +342,7 @@ impl InputInjector {
     pub fn release_held(&self) {
         let _serial=self.serial.lock().unwrap();
         self.discard_pointer();
+        { let mut touch=self.touch.lock().unwrap(); if std::mem::take(&mut touch.down) { self.inject_touch(2,0,0); } }
         let mut held=self.held.lock().unwrap();
         if let Some(uinput)=&self.uinput {
             Self::uinput_result(uinput.release_all());
@@ -494,8 +568,16 @@ impl InputInjector {
             }
         } else if self.backend==crate::desktop_backend::DesktopBackend::Portal {
             if std::env::var("UU_WAYLAND_TEXT").is_ok_and(|v|v=="0") { return; }
-            if self.paste_text_via_clipboard(text) {
-                log::info!("Desktop text input (Portal clipboard paste): chars={} result=ok", text.chars().count());
+            // Shift+Insert pastes the PRIMARY selection in VTE terminals, not the clipboard just set:
+            // type what the active layout has as keys and paste only the rest.
+            let typed=self.type_portal_keysyms(text);
+            if typed==text.chars().count() {
+                log::info!("Desktop text input (Portal keysyms): chars={typed}");
+                return;
+            }
+            let rest:String=text.chars().skip(typed).collect();
+            if self.paste_text_via_clipboard(&rest) {
+                log::info!("Desktop text input (Portal clipboard paste): chars={} typed={typed} result=ok", text.chars().count());
                 return;
             }
             static WARNED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
@@ -508,6 +590,14 @@ impl InputInjector {
                 log::warn!("Mobile text input is not supported on the {:?} backend yet", self.backend);
             }
         }
+    }
+    /// Types `text` as portal keysyms when it is all printable ASCII (or newline/tab) and GNOME's
+    /// active input source is a Latin xkb layout; returns how many characters were typed.
+    fn type_portal_keysyms(&self, text: &str) -> usize {
+        let Some(symbols)=ascii_keysyms(text) else { return 0 };
+        if !gnome_layout_types_ascii() { return 0; }
+        let Some(portal)=self.portal.lock().unwrap().clone() else { return 0 };
+        symbols.iter().take_while(|&&symbol| portal.type_keysym(symbol).is_ok()).count()
     }
     pub fn key_event(&self, keycode: i32, is_press: bool) {
         let _serial=self.serial.lock().unwrap();
@@ -645,7 +735,93 @@ impl InputInjector {
             uinput:None, screen:std::sync::Mutex::new((0,0)), portal_failures:std::sync::atomic::AtomicUsize::new(0),
             portal_outcomes:std::array::from_fn(|_|std::sync::atomic::AtomicUsize::new(0)),
             portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::DesktopBackend::Portal,
-            pending:std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()) }
+            pending:std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()),
+            touch:std::sync::Mutex::new(TouchDrag::default()) }
+    }
+}
+
+/// Keysyms for mobile IME text: printable ASCII is its own keysym, newline is Return, tab is Tab.
+fn ascii_keysyms(text: &str) -> Option<Vec<u32>> {
+    text.chars().map(|c| match c { '\n' => Some(0xff0d), '\t' => Some(0xff09), ' '..='~' => Some(c as u32), _ => None }).collect()
+}
+/// Whether an `org.gnome.desktop.input-sources` source list starts with an xkb layout that has
+/// printable ASCII in its first group. Mutter drops keysyms the active layout lacks, and an IBus
+/// engine (pinyin, ...) would compose the keys instead.
+fn first_source_types_ascii(sources: &str) -> bool {
+    let Some(start)=sources.find('(') else { return false };
+    let Some(end)=sources[start..].find(')') else { return false };
+    let fields:Vec<&str>=sources[start+1..start+end].split(',').map(|f| f.trim().trim_matches('\'')).collect();
+    let [kind, layout]=fields[..] else { return false };
+    let (base, variant)=layout.split_once('+').unwrap_or((layout, ""));
+    const NON_LATIN: &[&str]=&["af","am","ara","bd","bg","bt","by","eg","et","ge","gr","il","in","iq","ir","kg","kh","kz","la","lk","mk","mm","mn","mv","np","ru","sy","th","tj","ua"];
+    kind=="xkb" && !NON_LATIN.contains(&base) && !variant.contains("cyrillic") && (base!="rs" || variant.contains("latin"))
+}
+/// GNOME's active input source is the first of `mru-sources` (else of `sources`). Cached for 2 s.
+fn gnome_layout_types_ascii() -> bool {
+    #[cfg(test)]
+    { false }
+    #[cfg(not(test))]
+    {
+        static CACHE: std::sync::Mutex<Option<(std::time::Instant,bool)>> = std::sync::Mutex::new(None);
+        let mut cache=CACHE.lock().unwrap();
+        if let Some((at,value))=*cache { if at.elapsed()<std::time::Duration::from_secs(2) { return value; } }
+        let read=|key: &str| std::process::Command::new("gsettings").args(["get","org.gnome.desktop.input-sources",key])
+            .stderr(std::process::Stdio::null()).output().ok().filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).filter(|s| s.contains('('));
+        let value=read("mru-sources").or_else(|| read("sources")).is_some_and(|s| first_source_types_ascii(&s));
+        *cache=Some((std::time::Instant::now(),value));
+        value
+    }
+}
+
+#[cfg(test)]
+mod text_keysym_tests {
+    use super::*;
+    #[test]
+    fn ascii_text_becomes_keysyms_and_other_text_does_not() {
+        assert_eq!(ascii_keysyms("Hi!\n\t~"), Some(vec![0x48,0x69,0x21,0xff0d,0xff09,0x7e]));
+        assert_eq!(ascii_keysyms("čaj"), None);
+        assert_eq!(ascii_keysyms("测试"), None);
+    }
+    #[test]
+    fn only_latin_xkb_layouts_type_ascii() {
+        assert!(first_source_types_ascii("[('xkb', 'us'), ('ibus', 'libpinyin'), ('xkb', 'rs+latin')]"));
+        assert!(first_source_types_ascii("[('xkb', 'rs+latin')]"));
+        assert!(first_source_types_ascii("[('xkb', 'de+nodeadkeys')]"));
+        assert!(!first_source_types_ascii("[('ibus', 'libpinyin'), ('xkb', 'us')]"));
+        assert!(!first_source_types_ascii("[('xkb', 'rs')]"));
+        assert!(!first_source_types_ascii("[('xkb', 'ru')]"));
+        assert!(first_source_types_ascii("[('xkb', 'ba+unicodeus')]"));
+        assert!(!first_source_types_ascii("[('xkb', 'me+cyrillic')]"));
+        assert!(!first_source_types_ascii("@a(ss) []"));
+    }
+}
+
+#[cfg(test)]
+mod touch_tests {
+    use super::*;
+    #[test]
+    fn controller_from_platform_numbers_and_mac_strings() {
+        use serde_json::json;
+        assert_eq!(Controller::from_platform(Some(&json!(2))), Controller::Mobile);
+        assert_eq!(Controller::from_platform(Some(&json!("3"))), Controller::Mobile);
+        assert_eq!(Controller::from_platform(Some(&json!(4))), Controller::Mac);
+        assert_eq!(Controller::from_platform(Some(&json!("MacOS"))), Controller::Mac);
+        assert_eq!(Controller::from_platform(Some(&json!(1))), Controller::Other);
+        assert_eq!(Controller::from_platform(None), Controller::Other);
+    }
+    #[test]
+    fn mobile_drag_without_touchscreen_stays_a_mouse_button() {
+        let input=InputInjector::without_desktop();
+        input.set_controller(Controller::Mobile);
+        input.mouse_absolute_normalized(0.5,0.5,(100,100)); input.flush_pointer();
+        assert!(input.touch.lock().unwrap().at.is_some());
+        assert!(!input.touch_button(true) && !input.touch.lock().unwrap().down);
+        assert!(!input.touch_button(false));
+        input.mouse_relative(1,1); input.flush_pointer();
+        assert!(input.touch.lock().unwrap().at.is_none());
+        input.set_controller(Controller::Other);
+        assert!(!input.touch.lock().unwrap().mobile);
     }
 }
 
