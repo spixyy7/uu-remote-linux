@@ -42,6 +42,8 @@ pub struct Observed {
     pub video_expected:AtomicU64,
     /// Selected ICE pair round trip, refreshed by `route`; the video receiver waits about that long for NACKed packets.
     pub rtt_ms:AtomicU32,
+    /// `media::Receiver::recovery` of the video track.
+    pub video_recovery:[AtomicU64;3],
 }
 pub struct Peer {
     clipboard:super::clipboard::Bridge,
@@ -151,7 +153,8 @@ impl Peer {
                             },
                             Err(_)=>break,
                         },
-                        _=tick.tick()=>{if !video {continue} receiver.set_rtt(counters.rtt_ms.load(Ordering::Relaxed));receiver.expire()},
+                        _=tick.tick()=>{if !video {continue} receiver.set_rtt(counters.rtt_ms.load(Ordering::Relaxed));
+                            for (n,v) in receiver.recovery.iter().enumerate(){counters.video_recovery[n].store(*v,Ordering::Relaxed);}receiver.expire()},
                     };
                     if output.pli {desktop.reset.store(true,Ordering::Release);desktop.pli.store(true,Ordering::Release);}
                     for au in output.units {if desktop.units.push(super::media::AccessUnit{codec:receiver.codec(),data:au}) {desktop.reset.store(true,Ordering::Release);desktop.pli.store(true,Ordering::Release);}}

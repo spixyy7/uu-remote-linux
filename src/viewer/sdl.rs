@@ -442,8 +442,9 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
             _=heartbeat.tick()=>{
                 if input.enabled() && session.peer.ready(super::rtc::ReadyPolicy::EchoOnly,false){session.peer.send_input(&Input::heartbeat()).await?;}
                 let o=&session.peer.observed;let s=&super::desktop::STATS;let r=std::sync::atomic::Ordering::Relaxed;
-                log::info!("Viewer desktop stats: control_open={} echo={} media_packets={} access_units={} presented={} decode_errors={}",
-                    o.control_open.load(r),o.echo_received.load(r),o.media_packets.load(r),s[0].load(r),s[1].load(r),s[2].load(r));
+                log::info!("Viewer desktop stats: control_open={} echo={} media_packets={} access_units={} presented={} decode_errors={} video_received={} video_expected={} gaps_filled={} late={} gaps_skipped={}",
+                    o.control_open.load(r),o.echo_received.load(r),o.media_packets.load(r),s[0].load(r),s[1].load(r),s[2].load(r),
+                    o.video_received.load(r),o.video_expected.load(r),o.video_recovery[0].load(r),o.video_recovery[1].load(r),o.video_recovery[2].load(r));
                 // Network-status panel: per-second deltas of local counters plus the selected ICE pair.
                 let now=(s[1].load(r),o.media_bytes.load(r),o.video_received.load(r),o.video_expected.load(r),std::time::Instant::now());
                 let secs=now.4.duration_since(last.4).as_secs_f64().max(0.2);

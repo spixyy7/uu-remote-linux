@@ -23,10 +23,12 @@ pub struct Receiver {
     au: Vec<u8>, fragment: Option<u16>, damaged: bool, last_packet:Instant,
     /// How long a sequence gap may wait for a retransmission, and how many packets may queue behind it.
     patience:Duration, window:usize,
+    /// Gaps a late packet filled, packets that came after their gap was given up, gaps given up.
+    pub recovery:[u64;3],
 }
 impl Default for Receiver {
     fn default() -> Self { Self { codec: Codec::H264, next: None, pending: Vec::new(), timestamp: None, au: Vec::new(), fragment: None, damaged: false, last_packet:Instant::now(),
-        patience:Duration::from_millis(40), window:32 } }
+        patience:Duration::from_millis(40), window:32, recovery:[0;3] } }
 }
 impl Receiver {
     pub fn new(codec:Codec)->Self {Self{codec,..Self::default()}}
@@ -41,7 +43,9 @@ impl Receiver {
     pub fn push(&mut self, p: Packet) -> Output {
         if p.payload.len()>65536 {return Output{units:Vec::new(),pli:true}}
         let next = *self.next.get_or_insert(p.seq);
-        if p.seq.wrapping_sub(next) >= 32768 || self.pending.iter().any(|(_,q)| q.seq == p.seq) { return Output::default() }
+        if p.seq.wrapping_sub(next) >= 32768 {self.recovery[1]+=1;return Output::default()}
+        if self.pending.iter().any(|(_,q)| q.seq == p.seq) { return Output::default() }
+        if p.seq==next && !self.pending.is_empty() {self.recovery[0]+=1;}
         self.last_packet=Instant::now();
         self.pending.push((self.last_packet,p));
         let mut out = Output::default();
@@ -62,7 +66,7 @@ impl Receiver {
         out
     }
     fn skip_gap(&mut self, out: &mut Output) {
-        let next = self.next.unwrap();
+        let next = self.next.unwrap();self.recovery[2]+=1;
         self.next = self.pending.iter().min_by_key(|(_,p)| p.seq.wrapping_sub(next)).map(|(_,p)| p.seq);
         self.au.clear(); self.fragment = None; self.damaged = true; out.pli = true;
         self.drain(out);
