@@ -69,7 +69,7 @@ fn media_engine(shape:&Shape)->Result<MediaEngine,String>{
     }Ok(engine)
 }
 impl Peer {
-    pub async fn new(config:RTCConfiguration, shape:&Shape, app_id:&str, ice_id:&str, remote_client:&str, outbound:mpsc::Sender<Value>, settings:SettingEngine, mut clipboard:super::clipboard::Bridge)->Result<Self,String> {
+    pub async fn new(config:RTCConfiguration, shape:&Shape, app_id:&str, ice_id:&str, remote_client:&str, outbound:mpsc::Sender<Value>, mut settings:SettingEngine, mut clipboard:super::clipboard::Bridge)->Result<Self,String> {
         shape.validate_session()?;
         let mut engine=media_engine(shape)?;
         // UU RTP metadata the official Mac viewer offers (src/rtp_metadata.rs on the host side).
@@ -77,6 +77,9 @@ impl Peer {
             engine.register_header_extension(webrtc::rtp_transceiver::rtp_codec::RTCRtpHeaderExtensionCapability{uri:uri.into()},RTPCodecType::Video,None).map_err(|_|"RTP header extension registration failed")?;
         }
         let registry=webrtc::api::interceptor_registry::register_default_interceptors(webrtc::interceptor::registry::Registry::new(),&mut engine).map_err(|_|"RTP interceptor initialization failed")?;
+        // A NACKed copy arrives about one RTT after the original; the default 64-packet SRTP replay window
+        // (~160 ms at 1080p) rejects it as a replay. 1024 matches libwebrtc's SRTP policy.
+        settings.set_srtp_replay_protection_window(1024);
         let api=APIBuilder::new().with_media_engine(engine).with_setting_engine(settings).with_interceptor_registry(registry).build();
         let pc=Arc::new(api.new_peer_connection(config).await.map_err(|e|format!("Peer creation failed: {}",crate::auth::transport_error(&e)))?);
         let tools:super::tools::Inbox=Arc::new(std::sync::Mutex::new(None));

@@ -18,13 +18,14 @@ pub struct Packet { pub seq: u16, pub timestamp: u32, pub marker: bool, pub payl
 pub struct Output { pub units: Vec<Vec<u8>>, pub pli: bool }
 pub struct Receiver {
     codec: Codec,
-    next: Option<u16>, pending: Vec<Packet>, timestamp: Option<u32>,
-    au: Vec<u8>, fragment: Option<u16>, damaged: bool, gap_since:Option<Instant>, last_packet:Instant,
+    /// Packets after a gap with their arrival time: every gap expires on its own clock, so losses never queue up.
+    next: Option<u16>, pending: Vec<(Instant,Packet)>, timestamp: Option<u32>,
+    au: Vec<u8>, fragment: Option<u16>, damaged: bool, last_packet:Instant,
     /// How long a sequence gap may wait for a retransmission, and how many packets may queue behind it.
     patience:Duration, window:usize,
 }
 impl Default for Receiver {
-    fn default() -> Self { Self { codec: Codec::H264, next: None, pending: Vec::new(), timestamp: None, au: Vec::new(), fragment: None, damaged: false, gap_since:None,last_packet:Instant::now(),
+    fn default() -> Self { Self { codec: Codec::H264, next: None, pending: Vec::new(), timestamp: None, au: Vec::new(), fragment: None, damaged: false, last_packet:Instant::now(),
         patience:Duration::from_millis(40), window:32 } }
 }
 impl Receiver {
@@ -40,13 +41,12 @@ impl Receiver {
     pub fn push(&mut self, p: Packet) -> Output {
         if p.payload.len()>65536 {return Output{units:Vec::new(),pli:true}}
         let next = *self.next.get_or_insert(p.seq);
-        if p.seq.wrapping_sub(next) >= 32768 || self.pending.iter().any(|q| q.seq == p.seq) { return Output::default() }
+        if p.seq.wrapping_sub(next) >= 32768 || self.pending.iter().any(|(_,q)| q.seq == p.seq) { return Output::default() }
         self.last_packet=Instant::now();
-        self.pending.push(p);
+        self.pending.push((self.last_packet,p));
         let mut out = Output::default();
         self.drain(&mut out);
         if self.pending.len() >= self.window { self.skip_gap(&mut out); }
-        if self.pending.is_empty(){self.gap_since=None;}else{self.gap_since.get_or_insert(Instant::now());}
         out
     }
     // A timer bounds latency even if the missing packet is the last packet sent.
@@ -55,9 +55,7 @@ impl Receiver {
     }
     fn expire_at(&mut self,now:Instant)->Output {
         let mut out=Output::default();
-        if self.gap_since.is_some_and(|since|now.duration_since(since)>=self.patience) && !self.pending.is_empty() {
-            self.skip_gap(&mut out);self.gap_since=if self.pending.is_empty(){None}else{Some(now)};
-        }
+        while self.pending.iter().map(|(at,_)|*at).min().is_some_and(|at|now.duration_since(at)>=self.patience) {self.skip_gap(&mut out);}
         if !self.au.is_empty() && now.duration_since(self.last_packet)>=self.patience.max(Duration::from_millis(200)) {
             self.au.clear();self.fragment=None;self.damaged=true;out.pli=true;
         }
@@ -65,13 +63,13 @@ impl Receiver {
     }
     fn skip_gap(&mut self, out: &mut Output) {
         let next = self.next.unwrap();
-        self.next = self.pending.iter().min_by_key(|p| p.seq.wrapping_sub(next)).map(|p| p.seq);
+        self.next = self.pending.iter().min_by_key(|(_,p)| p.seq.wrapping_sub(next)).map(|(_,p)| p.seq);
         self.au.clear(); self.fragment = None; self.damaged = true; out.pli = true;
         self.drain(out);
     }
     fn drain(&mut self, out: &mut Output) {
-        while let Some(i) = self.pending.iter().position(|p| Some(p.seq) == self.next) {
-            let p = self.pending.remove(i); self.next = Some(p.seq.wrapping_add(1));
+        while let Some(i) = self.pending.iter().position(|(_,p)| Some(p.seq) == self.next) {
+            let (_,p) = self.pending.remove(i); self.next = Some(p.seq.wrapping_add(1));
             if self.timestamp != Some(p.timestamp) {
                 // A timestamp transition without marker is an incomplete AU.
                 if !self.au.is_empty() || self.fragment.is_some() { out.pli = true; }
@@ -193,6 +191,9 @@ mod tests {
         let o=r.push(p(11,1,false,&[0x7c,5,2]));assert!(!o.pli);assert_eq!(o.units[0],vec![0,0,0,1,0x65,1,2,3]);
         r.push(p(14,2,true,&[0x65]));let at=Instant::now();
         assert!(!r.expire_at(at+Duration::from_millis(390)).pli);assert!(r.expire_at(at+Duration::from_millis(401)).pli,"gives up after RTT + 150 ms");
+        // Two gaps seen at the same time expire together; the second does not wait behind the first.
+        let mut r=Receiver::default();r.set_rtt(250);r.push(p(20,3,true,&[0x65]));r.push(p(22,4,true,&[0x65]));r.push(p(24,5,true,&[0x65]));
+        let o=r.expire_at(Instant::now()+Duration::from_millis(401));assert!(o.pli);assert!(r.pending.is_empty());
         let mut r=Receiver::default();r.set_rtt(5000);r.set_rtt(0);
         assert_eq!((r.patience,r.window),(Duration::from_millis(600),1024),"capped; an unknown RTT keeps the last value");
         r.push(p(0,1,false,&[0x61]));for seq in 2..600{r.push(p(seq,seq as u32,true,&[0x65]));}assert_eq!(r.pending.len(),598,"a key frame fits behind a gap");
