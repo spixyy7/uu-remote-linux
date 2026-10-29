@@ -117,6 +117,8 @@ mod tests {
         assert_eq!(frame_len([0x40, 0x00, 0x00, 0x05]), Some(12));
         assert_eq!(frame_len([0x40, 0x00, 0x00, 0x08]), Some(12));
         assert_eq!(frame_len([0x80, 0x00, 0x00, 0x00]), None);
+        assert!(webrtc::ice::agent::turn_tcp::is_http_reply(*b"HTTP"));
+        assert!(!webrtc::ice::agent::turn_tcp::is_http_reply([0x40, 0x00, 0x00, 0x05]));
     }
 
     #[tokio::test]

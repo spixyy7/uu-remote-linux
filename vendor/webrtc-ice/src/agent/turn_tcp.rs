@@ -150,6 +150,12 @@ pub fn frame_len(header: [u8; 4]) -> Option<usize> {
     }
 }
 
+/// An HTTP reply inside the relay stream means a proxy is inspecting the (TLS) content;
+/// "HT" would otherwise parse as a ChannelData header.
+pub fn is_http_reply(header: [u8; 4]) -> bool {
+    &header == b"HTTP"
+}
+
 #[async_trait]
 impl Conn for FramedConn {
     async fn connect(&self, _: SocketAddr) -> util::Result<()> {
@@ -162,6 +168,11 @@ impl Conn for FramedConn {
         let mut reader = self.reader.lock().await;
         let mut header = [0u8; 4];
         reader.read_exact(&mut header).await?;
+        if is_http_reply(header) {
+            return Err(util::Error::Other(
+                "TURN TCP: got an HTTP response instead of TURN; a proxy is inspecting the TLS content, TURN cannot pass through it".into(),
+            ));
+        }
         let total = frame_len(header).ok_or_else(|| util::Error::Other("TURN TCP: unknown frame type".into()))?;
         let mut frame = vec![0u8; total];
         frame[..4].copy_from_slice(&header);
